@@ -4,14 +4,12 @@ from pydantic import BaseModel
 import asyncio
 import random
 import aiosqlite
-import time
+import contextlib
 
 app = FastAPI()
 
-origins = [
-    "*"
-]
-
+# CORS
+origins = ["*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -42,11 +40,6 @@ async def init_db():
         """)
         await db.commit()
 
-@app.on_event("startup")
-async def startup():
-    await init_db()
-    asyncio.create_task(game_loop())
-
 async def get_balance(telegram_id):
     async with aiosqlite.connect(DB_PATH) as db:
         row = await db.execute_fetchone("SELECT balance FROM users WHERE telegram_id = ?", (telegram_id,))
@@ -58,7 +51,10 @@ async def get_balance(telegram_id):
 
 async def update_balance(telegram_id, amount):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO users (telegram_id, balance) VALUES (?, ?) ON CONFLICT(telegram_id) DO UPDATE SET balance = balance + ?", (telegram_id, amount, amount))
+        await db.execute(
+            "INSERT INTO users (telegram_id, balance) VALUES (?, ?) ON CONFLICT(telegram_id) DO UPDATE SET balance = balance + ?",
+            (telegram_id, amount, amount)
+        )
         await db.commit()
 
 async def place_bet(telegram_id, amount):
@@ -69,7 +65,9 @@ async def place_bet(telegram_id, amount):
 
 async def cashout(telegram_id, multiplier):
     async with aiosqlite.connect(DB_PATH) as db:
-        row = await db.execute_fetchone("SELECT amount FROM bets WHERE telegram_id = ? AND cashed_out = 0", (telegram_id,))
+        row = await db.execute_fetchone(
+            "SELECT amount FROM bets WHERE telegram_id = ? AND cashed_out = 0", (telegram_id,)
+        )
         if row:
             win = row[0] * multiplier
             await db.execute("UPDATE users SET balance = balance + ? WHERE telegram_id = ?", (win, telegram_id))
@@ -116,7 +114,7 @@ async def do_cashout(data: TopUp):
         return {"status": "cashed out", "win": win}
     return {"status": "not running"}
 
-# ===================== GAME LOOP =====================
+# ===================== WEBSOCKET =====================
 
 connections = []
 
@@ -140,7 +138,7 @@ async def websocket_endpoint(ws: WebSocket):
     except WebSocketDisconnect:
         connections.remove(ws)
 
-# Game state
+# ===================== GAME LOOP =====================
 
 game_state = {
     "time_left": 10,
@@ -149,6 +147,7 @@ game_state = {
 }
 
 async def game_loop():
+    print("Game loop started 🚀")
     while True:
         # Countdown before flight
         game_state['time_left'] = 10
@@ -178,3 +177,15 @@ async def game_loop():
         await notify_all({"type": "end", "final_multiplier": multiplier})
         await reset_bets()
         await asyncio.sleep(2)
+
+# ===================== STARTUP / SHUTDOWN =====================
+
+@app.on_event("startup")
+async def startup():
+    await init_db()
+    app.state._game_task = asyncio.create_task(game_loop())
+
+@app.on_event("shutdown")
+async def shutdown():
+    with contextlib.suppress(Exception):
+        app.state._game_task.cancel()
