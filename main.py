@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import asyncio
@@ -8,7 +8,6 @@ import contextlib
 
 app = FastAPI()
 
-# CORS
 origins = ["*"]
 app.add_middleware(
     CORSMiddleware,
@@ -42,7 +41,8 @@ async def init_db():
 
 async def get_balance(telegram_id):
     async with aiosqlite.connect(DB_PATH) as db:
-        row = await db.execute_fetchone("SELECT balance FROM users WHERE telegram_id = ?", (telegram_id,))
+        cursor = await db.execute("SELECT balance FROM users WHERE telegram_id = ?", (telegram_id,))
+        row = await cursor.fetchone()
         if row:
             return row[0]
         await db.execute("INSERT INTO users (telegram_id, balance) VALUES (?, 0)", (telegram_id,))
@@ -65,9 +65,10 @@ async def place_bet(telegram_id, amount):
 
 async def cashout(telegram_id, multiplier):
     async with aiosqlite.connect(DB_PATH) as db:
-        row = await db.execute_fetchone(
+        cursor = await db.execute(
             "SELECT amount FROM bets WHERE telegram_id = ? AND cashed_out = 0", (telegram_id,)
         )
+        row = await cursor.fetchone()
         if row:
             win = row[0] * multiplier
             await db.execute("UPDATE users SET balance = balance + ? WHERE telegram_id = ?", (win, telegram_id))
@@ -83,12 +84,15 @@ async def reset_bets():
 
 # ===================== API =====================
 
-class TopUp(BaseModel):
+class BalanceAction(BaseModel):
     telegram_id: str
     amount: float
 
+class CashoutRequest(BaseModel):
+    telegram_id: str
+
 @app.post("/topup_balance")
-async def topup_balance(data: TopUp):
+async def topup_balance(data: BalanceAction):
     await update_balance(data.telegram_id, data.amount)
     return {"status": "success"}
 
@@ -98,7 +102,7 @@ async def get_user_balance(telegram_id: str):
     return {"balance": balance}
 
 @app.post("/bet")
-async def bet(data: TopUp):
+async def bet(data: BalanceAction):
     if not game_state['is_running'] and game_state['time_left'] <= 0:
         bal = await get_balance(data.telegram_id)
         if bal >= data.amount:
@@ -108,7 +112,7 @@ async def bet(data: TopUp):
     return {"status": "betting closed"}
 
 @app.post("/cashout")
-async def do_cashout(data: TopUp):
+async def do_cashout(data: CashoutRequest):
     if game_state['is_running']:
         win = await cashout(data.telegram_id, game_state['multiplier'])
         return {"status": "cashed out", "win": win}
@@ -132,6 +136,13 @@ async def notify_all(data):
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     connections.append(ws)
+    # Клиентке ағымдағы күйді жіберу
+    await ws.send_json({
+        "type": "state",
+        "is_running": game_state["is_running"],
+        "multiplier": game_state["multiplier"],
+        "time": game_state["time_left"]
+    })
     try:
         while True:
             await asyncio.sleep(10)
@@ -149,7 +160,6 @@ game_state = {
 async def game_loop():
     print("Game loop started 🚀")
     while True:
-        # Countdown before flight
         game_state['time_left'] = 10
         game_state['is_running'] = False
         await notify_all({"type": "countdown", "time": game_state['time_left']})
@@ -159,7 +169,6 @@ async def game_loop():
             game_state['time_left'] -= 1
             await notify_all({"type": "countdown", "time": game_state['time_left']})
 
-        # Plane starts flying
         game_state['is_running'] = True
         multiplier = 1.0
         await notify_all({"type": "start"})
@@ -169,11 +178,9 @@ async def game_loop():
             multiplier += round(random.uniform(0.01, 0.05), 2)
             game_state['multiplier'] = multiplier
             await notify_all({"type": "multiplier", "value": multiplier})
-
             if random.random() < 0.01 or multiplier > 100:
                 break
 
-        # End of flight
         await notify_all({"type": "end", "final_multiplier": multiplier})
         await reset_bets()
         await asyncio.sleep(2)
